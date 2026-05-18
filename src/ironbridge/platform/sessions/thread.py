@@ -169,8 +169,8 @@ class Thread(Resource):
         }
 
     @action(kind=ActionKind.READ)
-    def list(self) -> dict:
-        with tenant_session(self.tenant_id) as db:
+    def list(self, tenant_id: str = "") -> dict:
+        with tenant_session(tenant_id) as db:
             rows = db.execute(
                 text("SELECT id, created_at, updated_at FROM threads ORDER BY created_at DESC"),
             ).fetchall()
