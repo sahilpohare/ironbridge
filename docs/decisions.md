@@ -345,3 +345,51 @@ A running log of decisions made, why, and what changed.
 **Reasoning:** Platform is infrastructure. It should contain no business logic and no concrete implementations. `services/` is where integrations live. This mirrors the separation between a framework and applications built on it.
 
 **pyproject.toml:** Both `src/ironbridge` and `services` are declared as packages so both are on the Python path.
+
+---
+
+## 36. DeferredSendEffect for post-action effects that need the action result
+
+**Decision:** `ActionContext.send_after(service, handler, key, factory)` queues a `DeferredSendEffect`. The `factory` callable receives the serialized result dict from `ctx.run()` and builds the effect arg at execution time.
+
+**Reasoning:** `SendEffect` args are constructed before `ctx.run()` executes — before position is assigned. The first attempt patched position in `_execute_effects` by sniffing `effect.service == "ChannelDelivery"`, which violated domain boundaries. `DeferredSendEffect.factory(result)` is called *after* `ctx.run()` returns with the correct result, so position (or any other computed field) is available without `restate.py` knowing anything about `ChannelDelivery`.
+
+**Consequence:** `thread.py` uses `send_after` with a `_deliver_arg` factory. `restate.py` calls `factory(result)` generically.
+
+---
+
+## 37. Message insert uses ON CONFLICT (thread_id, idempotency_key) DO NOTHING
+
+**Decision:** `Message.Meta` sets `conflict_columns = ("thread_id", "idempotency_key")` and `conflict_action = "nothing"`. The repository issues `ON CONFLICT (thread_id, idempotency_key) DO NOTHING`.
+
+**Reasoning:** After Restate purge, replay generates a new message `id` but the same `idempotency_key`. `ON CONFLICT (id) DO UPDATE` violated the unique constraint on `(thread_id, idempotency_key)`. `DO NOTHING` on the natural key is correct — if the message already exists in the DB (source of truth), skip silently.
+
+**Consequence:** `ResourceMeta.__new__` was extended to parse `conflict_columns` and `conflict_action` from `Meta`. The repository checks for these before falling back to the PK upsert path.
+
+---
+
+## 38. Dead run recovery in _enqueue_run via Restate status API
+
+**Decision:** Before queuing a new run, `_enqueue_run` calls `GET /AgentRun/{active_run_id}/status` via Restate ingress. If the status is not `"running"`, it clears `active_run_id` and `pending_runs` and fires immediately.
+
+**Reasoning:** After Restate purge, `active_run_id` is set in Thread VirtualObject state but the workflow no longer exists. `_run_done` will never fire. Without this check the thread queue is permanently blocked. DB `agent_run_events` is a reflection of Restate state, not the authority — checking the DB run state would be wrong.
+
+**Consequence:** Restate is the owner of run lifecycle. The status check adds one HTTP call per `_enqueue_run` invocation when a run is active, but this is inside `ctx.run()` so it is journaled and not repeated on replay.
+
+---
+
+## 39. ctx.generic_send replaces httpx.post for add_message in workflow handlers
+
+**Decision:** `restate_workflow.py` uses `ctx.generic_send` + `AddMessageRequest.model_dump_json()` instead of `_call_add_message` (which used `httpx.post`).
+
+**Reasoning:** `httpx.post` from inside a Restate workflow handler causes a deadlock-like timeout — the workflow is executing while trying to call back into the Restate ingress synchronously. This caused workflows to pause and `_run_done` to never fire, permanently blocking the thread queue.
+
+**Consequence:** All message writes from workflow handlers go through `ctx.generic_send`. `_call_add_message` and `_write_orphaned_message` helpers were removed.
+
+---
+
+## 40. LLM provider via env vars
+
+**Decision:** `LLM_MODEL`, `LLM_API_KEY`, `LLM_BASE_URL`, and `OPENROUTER_API_KEY` control the LLM. LiteLLM prefix conventions apply: `cerebras/<model>`, `openrouter/<provider>/<model>`.
+
+**Note:** The plain weather agent (`weather_agent.py`) uses the raw OpenAI client — it strips the `openrouter/` prefix and sets `base_url` to OpenRouter manually. LiteLLM is not used there.
