@@ -17,14 +17,54 @@ from abc import ABC, abstractmethod
 import httpx
 from cuid2 import cuid_wrapper
 
+from ironbridge.platform.channels.channel_binding import ChannelBinding
 from ironbridge.platform.channels.context import ChannelContext
 from ironbridge.platform.channels.message import ChannelMessage
+from ironbridge.shared.db import tenant_session
+from ironbridge.shared.derive.repository import SqlAlchemyRepository
 
 _cuid = cuid_wrapper()
 
 
 class BaseChannelAdapter(ABC):
     channel_type: str  # must override — matches Channel.channel_type in DB
+
+    def new_thread(
+        self,
+        tenant_id: str,
+        channel_id: str,
+        restate_url: str | None = None,
+    ) -> str:
+        """
+        Create a new Thread via Restate, bind it to the channel, and return the
+        thread_id. Call this for /new or any reset command. The adapter is
+        responsible for remembering the returned thread_id as the active thread.
+        """
+        thread_id = _cuid()
+        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
+        httpx.post(
+            f"{base}/Thread/{thread_id}/create",
+            json={"tenant_id": tenant_id},
+            timeout=10,
+        )
+        self.bind_thread(tenant_id, thread_id, channel_id)
+        return thread_id
+
+    def bind_thread(self, tenant_id: str, thread_id: str, channel_id: str) -> None:
+        """
+        Bind a channel to a thread. Idempotent — safe to call on every inbound
+        message. The channel must already exist (registered by the tenant).
+        The adapter tracks which thread_id is currently active per external conversation.
+        """
+        with tenant_session(tenant_id) as db:
+            binding_repo = SqlAlchemyRepository(db, ChannelBinding)
+            if not binding_repo.find_by(thread_id=thread_id, channel_id=channel_id):
+                binding = ChannelBinding()
+                binding.id = _cuid()
+                binding.thread_id = thread_id
+                binding.channel_id = channel_id
+                binding_repo.save(binding)
+            db.commit()
 
     @abstractmethod
     def on_message(self, message: ChannelMessage, config: dict, ctx: ChannelContext) -> None:
@@ -50,6 +90,17 @@ class BaseChannelAdapter(ABC):
         ctx    — ChannelContext for writing back to the thread.
         """
         ...
+
+    def get_thread(self, tenant_id: str, thread_id: str, restate_url: str | None = None) -> dict:
+        """Fetch thread + messages via Restate."""
+        base = restate_url or os.environ.get("RESTATE_URL", "http://localhost:8080")
+        r = httpx.post(
+            f"{base}/Thread/{thread_id}/get",
+            json={"tenant_id": tenant_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
 
     def receive(
         self,

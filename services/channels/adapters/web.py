@@ -15,22 +15,16 @@ import logging
 import os
 
 import pusher
-from cuid2 import cuid_wrapper
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ironbridge.platform.channels.channel import Channel
-from ironbridge.platform.channels.channel_binding import ChannelBinding
 from ironbridge.platform.channels.context import ChannelContext
 from ironbridge.platform.channels.message import ChannelMessage
 from ironbridge.platform.channels.registry import register_adapter
-from ironbridge.shared.db import tenant_session
-from ironbridge.shared.derive.repository import SqlAlchemyRepository
 from services.channels.adapters.base import BaseChannelAdapter
 
 logger = logging.getLogger(__name__)
-_cuid = cuid_wrapper()
 
 _client: pusher.Pusher | None = None
 
@@ -48,13 +42,12 @@ def _get_client() -> pusher.Pusher:
     return _client
 
 
-class _BindRequest(BaseModel):
-    thread_id: str
+class _CreateThreadRequest(BaseModel):
+    channel_id: str
 
 
-class _SendRequest(BaseModel):
-    thread_id: str
-    text: str
+class _SendMessageRequest(BaseModel):
+    content: dict
     participant_id: str = ""
     agent_id: str = "stub"
 
@@ -92,32 +85,8 @@ class WebAdapter(BaseChannelAdapter):
             if not header_tenant or header_tenant != tenant_id:
                 raise HTTPException(status_code=403, detail="Tenant mismatch")
 
-            with tenant_session(tenant_id) as db:
-                channel_repo = SqlAlchemyRepository(db, Channel)
-                binding_repo = SqlAlchemyRepository(db, ChannelBinding)
-
-                # Find or create the tenant's web channel
-                existing = channel_repo.find_by(channel_type="web")
-                if existing:
-                    channel_id = existing.id
-                else:
-                    channel = Channel()
-                    channel.create(name="Web", channel_type="web")
-                    channel_repo.save(channel)
-                    channel_id = channel.id
-
-                # Bind thread → channel if not already bound
-                bound = binding_repo.find_by(thread_id=body.thread_id)
-                if not bound:
-                    binding = ChannelBinding()
-                    binding.id = _cuid()
-                    binding.thread_id = body.thread_id
-                    binding.channel_id = channel_id
-                    binding_repo.save(binding)
-
-                db.commit()
-
-            return JSONResponse({"channel_id": channel_id})
+            self.bind_thread(tenant_id, body.thread_id, body.channel_id)
+            return JSONResponse({"ok": True})
 
         @router.post("/{tenant_id}/channels/web/send")
         async def send(

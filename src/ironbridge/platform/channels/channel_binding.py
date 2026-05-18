@@ -27,22 +27,22 @@ class ChannelBinding(Resource):
 
     __tablename__ = "channel_bindings"
     __table_args__ = (
-        UniqueConstraint("thread_id", name="uq_channel_bindings_thread_id"),
+        UniqueConstraint("thread_id", "channel_id", name="uq_channel_bindings_thread_channel"),
     )
 
     id         : Mapped[str]      = mapped_column(String, primary_key=True, default=_cuid)
-    thread_id  : Mapped[str]      = mapped_column(String, nullable=False, unique=True, index=True)
+    thread_id  : Mapped[str]      = mapped_column(String, nullable=False, index=True)
     channel_id : Mapped[str]      = mapped_column(String, nullable=False, index=True)
     created_at : Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-def resolve_channel_for_thread(thread_id: str, tenant_id: str | None) -> str | None:
-    """Return channel_id bound to this thread, or None."""
+def resolve_channels_for_thread(thread_id: str, tenant_id: str | None) -> list[str]:
+    """Return all channel_ids bound to this thread."""
     if not tenant_id:
-        return None
+        return []
     with tenant_session(tenant_id) as db:
-        row = db.execute(
-            text("SELECT channel_id FROM channel_bindings WHERE thread_id = :tid LIMIT 1"),
+        rows = db.execute(
+            text("SELECT channel_id FROM channel_bindings WHERE thread_id = :tid"),
             {"tid": thread_id},
-        ).fetchone()
-    return row[0] if row else None
+        ).fetchall()
+    return [row[0] for row in rows]

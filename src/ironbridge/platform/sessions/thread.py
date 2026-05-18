@@ -7,7 +7,7 @@ from sqlalchemy import DateTime, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ironbridge.platform.channels.channel import resolve_agent_for_channel
-from ironbridge.platform.channels.channel_binding import resolve_channel_for_thread
+from ironbridge.platform.channels.channel_binding import resolve_channels_for_thread
 from ironbridge.platform.sessions.message import Message, MessageRole, ParticipantType
 from ironbridge.shared.db import tenant_session
 from ironbridge.shared.framework import ActionContext, ActionKind, Resource, action
@@ -104,8 +104,8 @@ class Thread(Resource):
         if ParticipantType(participant_type) == ParticipantType.HUMAN and not is_response_reply:
             run_id = _cuid()
             if not agent_id:
-                channel_id = resolve_channel_for_thread(self.id, self.tenant_id)
-                agent_id = resolve_agent_for_channel(channel_id, self.tenant_id) if channel_id else "stub"
+                channel_ids = resolve_channels_for_thread(self.id, self.tenant_id)
+                agent_id = resolve_agent_for_channel(channel_ids[0], self.tenant_id) if channel_ids else "stub"
             action_ctx.send_workflow(
                 service="AgentRun",
                 key=run_id,
@@ -117,22 +117,19 @@ class Thread(Resource):
                 },
             )
 
-        # Route all messages to channel for adapters to filter.
+        # Fanout to all channels bound to this thread.
         # send_after defers arg construction until after position is assigned.
-        channel_id = resolve_channel_for_thread(self.id, self.tenant_id)
-        if channel_id:
-            _channel_id = channel_id
-            _thread_id = self.id
-            _tenant_id = self.tenant_id
-            _participant_id = participant_id
-            _participant_type = participant_type
-            _role = role
-            _content = content
-
-            def _deliver_arg(result: dict) -> dict:
+        _thread_id = self.id
+        _tenant_id = self.tenant_id
+        _participant_id = participant_id
+        _participant_type = participant_type
+        _role = role
+        _content = content
+        for _channel_id in resolve_channels_for_thread(self.id, self.tenant_id):
+            def _deliver_arg(result: dict, cid: str = _channel_id) -> dict:
                 return {
                     "thread_id": _thread_id,
-                    "channel_id": _channel_id,
+                    "channel_id": cid,
                     "tenant_id": _tenant_id,
                     "message": {
                         "participant_id": _participant_id,
