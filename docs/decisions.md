@@ -393,3 +393,51 @@ A running log of decisions made, why, and what changed.
 **Decision:** `LLM_MODEL`, `LLM_API_KEY`, `LLM_BASE_URL`, and `OPENROUTER_API_KEY` control the LLM. LiteLLM prefix conventions apply: `cerebras/<model>`, `openrouter/<provider>/<model>`.
 
 **Note:** The plain weather agent (`weather_agent.py`) uses the raw OpenAI client — it strips the `openrouter/` prefix and sets `base_url` to OpenRouter manually. LiteLLM is not used there.
+
+---
+
+## 41. New human message auto-cancels the active run
+
+**Decision:** In `_enqueue_run`, when a run is active and `"running"`, call `cancel()` on the active `AgentRun` workflow via `ctx.workflow_send` before clearing state and firing the new run. The pending queue is also drained.
+
+**Reasoning:** If a run is suspended on a HITL promise and the user sends a new message, they are signalling intent to move on. Keeping the HITL run alive blocks the queue indefinitely. The user can re-answer the question by typing in the message box — the next run will re-read the full thread history and re-ask any disambiguation if needed.
+
+**Consequence:** Only one `AgentRun` is ever active per thread at a time and the queue never grows beyond depth 1. The cancelled run's `AgentCancelledError` path fires cleanly, `_run_done` is sent, but since `active_run_id` is already cleared by the time it arrives, it is a no-op. `reply.approved` / `reply.selected` are never resolved for abandoned HITL promises — the workflow exits without resolving them, which is safe.
+
+---
+
+## 42. Dead run recovery uses workflow_call, cancel uses workflow_send
+
+**Decision:** The status check in `_enqueue_run` uses `ctx.workflow_call(status_fn, ...)` (awaited, journaled) instead of `httpx.get`. The cancel uses `ctx.workflow_send(cancel_fn, ...)` (fire-and-forget, journaled).
+
+**Reasoning:** HTTP calls inside Restate handlers must go through `ctx.run()` to be journaled. Using the SDK's `workflow_call`/`workflow_send` is already durable and avoids the extra `ctx.run()` wrapper. It also removes the dependency on `httpx` from this path entirely.
+
+---
+
+## 43. HITL supports arbitrary multiple-choice options
+
+**Decision:** `ctx.request_approval(options=[...])` accepts any list of `{id, label}` pairs. Callers use `reply.selected[0]` to read the result, not `reply.approved` (which is only `True` for id `"approve"` or `"yes"`).
+
+**Reasoning:** Binary approve/deny is too limiting. Location disambiguation, report format selection, and similar choices need N options. The HITL mechanism is generic — the option IDs are arbitrary strings.
+
+**Consequence:** All multi-choice HITL consumers must check `reply.timed_out` and `reply.selected`, never `reply.approved`. `StubAgent` demonstrates this pattern: messages containing "choose", "pick", or "options" trigger a 4-option card.
+
+---
+
+## 44. Many-to-many thread ↔ channel bindings
+
+**Decision:** `ChannelBinding` uses `UNIQUE(thread_id, channel_id)` — one thread can be bound to multiple channels (e.g. web UI + Discord). `resolve_channels_for_thread` returns `list[str]`. Thread.add_message fans out to all bound channels.
+
+**Reasoning:** A thread is the canonical conversation. Multiple channel surfaces (web, Discord, Slack) may need to observe the same thread. A `UNIQUE(thread_id)` constraint would prevent this.
+
+**Consequence:** The fanout loop in `Thread.add_message` uses a closure-capture fix (`cid: str = _channel_id` default arg) to avoid the classic Python loop-capture bug.
+
+---
+
+## 45. BaseChannelAdapter provides lifecycle helpers
+
+**Decision:** `get_or_create_channel`, `new_thread`, and `bind_thread` live on `BaseChannelAdapter`, not on individual adapters.
+
+**Reasoning:** Every adapter needs the same DB operations to provision its channel record and manage thread bindings. Duplicating this logic per adapter was error-prone.
+
+**Consequence:** Adapters call `self.get_or_create_channel(tenant_id)` on first use (idempotent). `new_thread` creates a Restate Thread and binds it in one call. `bind_thread` uses `UNIQUE(thread_id, channel_id)` — safe to call on every inbound request.
