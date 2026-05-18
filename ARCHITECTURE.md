@@ -51,15 +51,15 @@ src/ironbridge/
 
 services/
 ├── agents/                # Concrete agent implementations
-│   ├── stub.py            # StubAgent — registers as "stub"
-│   ├── weather_agent.py   # WeatherAgent — registers as "weather"
-│   └── ...
+│   ├── stub.py            # StubAgent — registers as "stub"; demos binary + multi-choice HITL
+│   └── weather_agent.py   # WeatherAgent — registers as "weather"; LLM tool use + location disambiguation HITL
 └── channels/
     └── adapters/          # Concrete channel adapters
-        ├── base.py        # BaseChannelAdapter ABC
-        ├── web.py         # WebAdapter — Pusher outbound, FastAPI inbound
-        ├── cli.py         # CliAdapter — stdout outbound, REPL inbound
-        └── webhook.py     # WebhookAdapter — HTTP POST outbound
+        ├── base.py             # BaseChannelAdapter ABC (get_or_create_channel, new_thread, bind_thread)
+        ├── web.py              # WebAdapter — Pusher outbound, FastAPI inbound
+        ├── cli.py              # CliAdapter — stdout outbound, REPL inbound
+        ├── discord_adapter.py  # DiscordAdapter — discord.py gateway
+        └── webhook.py          # WebhookAdapter — HTTP POST outbound
 ```
 
 ---
@@ -121,10 +121,12 @@ status           enum          ACTIVE | INACTIVE
 
 ```
 id          cuid
-thread_id   string   UNIQUE — one channel per thread
+thread_id   string   UNIQUE(thread_id, channel_id) — many-to-many
 channel_id  string
 created_at  timestamptz
 ```
+
+One thread can be bound to multiple channels (e.g. web UI + Discord). Messages fan out to all bound channels. `resolve_channels_for_thread` returns `list[str]`.
 
 ---
 
@@ -143,14 +145,16 @@ ChannelDelivery (Restate Service — stateless, concurrent)
        ├─ build ChannelMessage (Pydantic discriminated union of parts)
        └─ adapter.on_message(message, config, channel_ctx)
        │
-       ├─ WebAdapter   → Pusher trigger → browser
-       ├─ CliAdapter   → stdout
+       ├─ WebAdapter     → Pusher trigger → browser
+       ├─ CliAdapter     → stdout
+       ├─ DiscordAdapter → REST API POST to Discord channel
        └─ WebhookAdapter → HTTP POST to callback_url
 
 Inbound (channel → thread):
-  WebAdapter.get_router()   → /api/{tenant}/channels/web/bind
-                            → /api/{tenant}/channels/web/send
-  CliAdapter.run_cli()      → interactive REPL → receive() → Restate ingress
+  WebAdapter.get_router()      → /api/{tenant}/channels/web/bind
+                               → /api/{tenant}/channels/web/send
+  CliAdapter.run_cli()         → interactive REPL → receive() → Restate ingress
+  DiscordAdapter.run_bot()     → discord.py gateway → receive() → Restate ingress
   BaseChannelAdapter.receive() → POST /Thread/{id}/add_message on Restate
 ```
 
@@ -182,9 +186,16 @@ WebAdapter.send()
             ├─ [if response_reply] → AgentRun.resolve_hitl(...)
             │
             ├─ [if HUMAN + not response_reply]
-            │    → ctx.workflow_send(AgentRun.run, key=run_id, arg=AgentRunRequest)
+            │    → ctx.generic_send(Thread, "_enqueue_run", run_req)
+            │         │
+            │         ├─ active run exists + running?
+            │         │    → workflow_send(AgentRun.cancel, key=active)  ← SDK call
+            │         │    → clear active_run_id + pending_runs
+            │         ├─ active run dead? → clear state
+            │         └─ fire workflow_send(AgentRun.run, key=run_id, ...)
             │
             └─ ctx.generic_send(ChannelDelivery, "deliver", ...)  ← ALL messages
+                 (one send per bound channel — fanout)
 ```
 
 ---
@@ -203,13 +214,13 @@ AgentRun Workflow (Restate Workflow — one-shot, durable)
        │    on RetryableError → writes AGENT_RUN_RETRY to thread, re-raises
        ├─ ctx.step("llm_call_N")
        │
-       ├─ [if tool requires approval]
-       │    ctx.request_approval(prompt, options)
+       ├─ [if tool requires approval OR multi-choice needed]
+       │    ctx.request_approval(prompt, options=[{id, label}, ...])
        │      → write response_request part to thread
        │      → suspend on named promise hitl:{request_id}
-       │      [human replies with response_reply]
-       │      → derive/restate.py routes to AgentRun.resolve_hitl
-       │      → promise resolved → workflow resumes
+       │      [human clicks card OR sends new message]
+       │        case reply:    → response_reply → resolve_hitl → promise resolved → resume
+       │        case new msg:  → _enqueue_run cancels this workflow → AgentCancelledError
        │
        └─ ctx.write_message(content) → Thread.add_message
 
