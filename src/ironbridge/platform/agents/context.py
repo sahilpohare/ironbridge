@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import time
 import typing
 from collections.abc import Callable
 from datetime import timedelta
@@ -61,6 +60,7 @@ class AgentContext:
         self.agent_id = req.agent_id
         self._hitl = HITL(restate_ctx, req.thread_id, req.run_id, req.tenant_id)
         self._cancel_promise = restate_ctx.promise("cancel")
+        self._retry_counts: dict[str, int] = {}
 
     async def step(self, name: str, fn: Callable) -> Any:
         """
@@ -85,7 +85,7 @@ class AgentContext:
                 result = fn()
                 if isinstance(result, BaseModel):
                     return result.model_dump(mode="json")
-                if isinstance(result, list) and result and isinstance(result[0], BaseModel):
+                if isinstance(result, list) and all(isinstance(item, BaseModel) for item in result):
                     return [item.model_dump(mode="json") for item in result]
                 return result
             except Exception as e:
@@ -97,7 +97,8 @@ class AgentContext:
         try:
             result = await self._ctx.run(name, _guarded)
         except RetryableError as e:
-            ikey = hashlib.sha256(f"{self.run_id}:retry:{name}:{int(time.time())}".encode()).hexdigest()[:16]
+            self._retry_counts[name] = self._retry_counts.get(name, 0) + 1
+            ikey = hashlib.sha256(f"{self.run_id}:retry:{name}:{self._retry_counts[name]}".encode()).hexdigest()[:16]
             self._ctx.generic_send(
                 "Thread",
                 "add_message",
