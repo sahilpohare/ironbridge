@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from restate.exceptions import RetryableError, TerminalError
 
 from ironbridge.platform.agents.agent_run import AgentRunRequest
-from ironbridge.platform.agents.hitl import HITL, HumanResponse, _call_add_message
+from ironbridge.platform.agents.hitl import HITL, HumanResponse
 from ironbridge.platform.sessions.thread import MessageView
 from ironbridge.shared.db import tenant_session
 
@@ -97,7 +97,21 @@ class AgentContext:
         try:
             result = await self._ctx.run(name, _guarded)
         except RetryableError as e:
-            _write_retry_event(self.thread_id, self.run_id, self.tenant_id, name, str(e))
+            ikey = hashlib.sha256(f"{self.run_id}:retry:{name}:{int(time.time())}".encode()).hexdigest()[:16]
+            self._ctx.generic_send(
+                "Thread",
+                "add_message",
+                json.dumps({
+                    "participant_id": f"agent-run-{self.run_id}",
+                    "participant_type": "AGENT",
+                    "role": "SYSTEM",
+                    "content": {"version": 1, "parts": [{"type": "event", "event": "AGENT_RUN_RETRY", "step": name, "error": str(e)}]},
+                    "idempotency_key": ikey,
+                    "tenant_id": self.tenant_id,
+                    "user_name": f"agent-run-{self.run_id}",
+                }).encode(),
+                key=self.thread_id,
+            )
             raise
 
         # Reconstruct Pydantic models from journaled dicts using return type hint
@@ -235,30 +249,3 @@ def _fetch_thread(thread_id: str, tenant_id: str, limit: int = 200) -> list[Mess
         return instance.get_messages(limit=limit)
 
 
-def _write_retry_event(
-    thread_id: str, run_id: str, tenant_id: str, step_name: str, error: str
-) -> None:
-    """
-    Write an AGENT_RUN_RETRY event message to the thread.
-    Called synchronously inside _guarded() before re-raising RetryableError.
-    Surfaces retry notifications to UI via Pusher.
-    """
-    ikey = hashlib.sha256(f"{run_id}:retry:{step_name}:{int(time.time())}".encode()).hexdigest()[:16]
-    _call_add_message(
-        thread_id=thread_id,
-        run_id=run_id,
-        tenant_id=tenant_id,
-        content={
-            "version": 1,
-            "parts": [
-                {
-                    "type": "event",
-                    "event": "AGENT_RUN_RETRY",
-                    "step": step_name,
-                    "error": error,
-                }
-            ],
-        },
-        idempotency_key=ikey,
-        role="SYSTEM",
-    )

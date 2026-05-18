@@ -40,12 +40,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-import httpx
 import restate
 from cuid2 import cuid_wrapper
 
@@ -104,18 +102,19 @@ class HITL:
             lambda: _cuid(),
         )
 
-        await self._ctx.run(
-            f"write_response_request:{request_id}",
-            lambda rid=request_id: _call_add_message(
-                thread_id=self._thread_id,
-                run_id=self._run_id,
-                tenant_id=self._tenant_id,
-                content={
+        self._ctx.generic_send(
+            "Thread",
+            "add_message",
+            json.dumps({
+                "participant_id": f"agent-run-{self._run_id}",
+                "participant_type": "AGENT",
+                "role": "ASSISTANT",
+                "content": {
                     "version": 1,
                     "parts": [
                         {
                             "type": "response_request",
-                            "request_id": rid,
+                            "request_id": request_id,
                             "prompt": prompt,
                             "options": options,
                             "multi_select": multi_select,
@@ -124,8 +123,11 @@ class HITL:
                         }
                     ],
                 },
-                idempotency_key=f"{self._run_id}:request:{rid}",
-            ),
+                "idempotency_key": f"{self._run_id}:request:{request_id}",
+                "tenant_id": self._tenant_id,
+                "user_name": f"agent-run-{self._run_id}",
+            }).encode(),
+            key=self._thread_id,
         )
 
         # Named durable promise — survives Restate restart, scoped to workflow key.
@@ -144,19 +146,22 @@ class HITL:
                 result_key, result_data = "timeout", None
 
         if result_key == "timeout":
-            await self._ctx.run(
-                f"write_request_timeout:{request_id}",
-                lambda rid=request_id: _call_add_message(
-                    thread_id=self._thread_id,
-                    run_id=self._run_id,
-                    tenant_id=self._tenant_id,
-                    content={
+            self._ctx.generic_send(
+                "Thread",
+                "add_message",
+                json.dumps({
+                    "participant_id": f"agent-run-{self._run_id}",
+                    "participant_type": "AGENT",
+                    "role": "SYSTEM",
+                    "content": {
                         "version": 1,
-                        "parts": [{"type": "event", "event": "RESPONSE_TIMED_OUT", "request_id": rid}],
+                        "parts": [{"type": "event", "event": "RESPONSE_TIMED_OUT", "request_id": request_id}],
                     },
-                    idempotency_key=f"{self._run_id}:timeout:{rid}",
-                    role="SYSTEM",
-                ),
+                    "idempotency_key": f"{self._run_id}:timeout:{request_id}",
+                    "tenant_id": self._tenant_id,
+                    "user_name": f"agent-run-{self._run_id}",
+                }).encode(),
+                key=self._thread_id,
             )
             return HumanResponse(selected=[], submitted_by="", timed_out=True)
 
@@ -173,62 +178,39 @@ class HITL:
         key = hashlib.sha256(
             f"{self._run_id}:inject:{json.dumps(content, sort_keys=True)}".encode()
         ).hexdigest()[:16]
-        await self._ctx.run(
-            f"inject_message:{key}",
-            lambda: _call_add_message(
-                thread_id=self._thread_id,
-                run_id=self._run_id,
-                tenant_id=self._tenant_id,
-                content=content,
-                idempotency_key=f"{self._run_id}:inject:{key}",
-            ),
+        self._ctx.generic_send(
+            "Thread",
+            "add_message",
+            json.dumps({
+                "participant_id": f"agent-run-{self._run_id}",
+                "participant_type": "AGENT",
+                "role": "ASSISTANT",
+                "content": content,
+                "idempotency_key": f"{self._run_id}:inject:{key}",
+                "tenant_id": self._tenant_id,
+                "user_name": f"agent-run-{self._run_id}",
+            }).encode(),
+            key=self._thread_id,
         )
 
     async def checkpoint(self, label: str, state: dict | None = None) -> None:
         """Agent saves current state at a named point."""
-        await self._ctx.run(
-            f"checkpoint:{label}",
-            lambda: _call_add_message(
-                thread_id=self._thread_id,
-                run_id=self._run_id,
-                tenant_id=self._tenant_id,
-                content={
+        self._ctx.generic_send(
+            "Thread",
+            "add_message",
+            json.dumps({
+                "participant_id": f"agent-run-{self._run_id}",
+                "participant_type": "AGENT",
+                "role": "SYSTEM",
+                "content": {
                     "version": 1,
                     "parts": [{"type": "event", "event": "CHECKPOINT", "label": label, "state": state or {}}],
                 },
-                idempotency_key=f"{self._run_id}:checkpoint:{label}",
-                role="SYSTEM",
-            ),
+                "idempotency_key": f"{self._run_id}:checkpoint:{label}",
+                "tenant_id": self._tenant_id,
+                "user_name": f"agent-run-{self._run_id}",
+            }).encode(),
+            key=self._thread_id,
         )
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
-
-
-def _call_add_message(
-    thread_id: str,
-    run_id: str,
-    tenant_id: str,
-    content: dict,
-    idempotency_key: str | None = None,
-    role: str = "ASSISTANT",
-) -> None:
-    restate_base = os.environ.get("RESTATE_URL", "http://localhost:8080")
-    if idempotency_key is None:
-        idempotency_key = hashlib.sha256(
-            f"{run_id}:{json.dumps(content, sort_keys=True)}".encode()
-        ).hexdigest()[:16]
-    httpx.post(
-        f"{restate_base}/Thread/{thread_id}/add_message",
-        headers={"idempotency-key": idempotency_key},
-        json={
-            "participant_id": f"agent-run-{run_id}",
-            "participant_type": "AGENT",
-            "role": role,
-            "content": content,
-            "idempotency_key": idempotency_key,
-            "tenant_id": tenant_id,
-            "user_name": f"agent-run-{run_id}",
-        },
-        timeout=10,
-    )
