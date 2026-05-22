@@ -91,7 +91,7 @@ class AgentContext:
             except Exception as e:
                 status = getattr(e, "status_code", None)
                 if status in _TERMINAL_STATUS_CODES:
-                    raise TerminalError(str(e), status_code=500)
+                    raise TerminalError(str(e), status_code=400)
                 raise
 
         try:

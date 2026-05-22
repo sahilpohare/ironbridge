@@ -221,9 +221,7 @@ def _attach_handler(
                     if _is_positional and next_pos is not None and hasattr(result, "position"):
                         result.position = next_pos
 
-                    if _kind.implicit_save and isinstance(result, Resource):
-                        repo.save(result)
-                    elif _kind == ActionKind.ACTION and isinstance(result, Resource):
+                    if (_kind.implicit_save or _kind == ActionKind.ACTION) and isinstance(result, Resource):
                         repo.save(result)
                     elif _kind.implicit_delete:
                         repo.delete(ctx.key())
