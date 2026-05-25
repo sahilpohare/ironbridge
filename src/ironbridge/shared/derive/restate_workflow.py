@@ -97,13 +97,13 @@ async def run(ctx: WorkflowContext, req: AgentRunRequest) -> AgentRunResult:
             "Thread",
             "add_message",
             AddMessageRequest(
-                participant_id=f"agent-run-{req.run_id}",
+                participant_id=req.agent_id,
                 participant_type="AGENT",
                 role="SYSTEM",
                 content={"version": 1, "parts": [{"type": "event", "event": "AGENT_RUN_FAILED", "error": err_msg}]},
                 idempotency_key=f"{req.run_id}:failed",
                 tenant_id=req.tenant_id,
-                user_name=f"agent-run-{req.run_id}",
+                user_name=req.agent_id,
             ).model_dump_json().encode(),
             key=req.thread_id,
         )
@@ -152,13 +152,13 @@ async def resolve_hitl(ctx: WorkflowContext, req: ResolveHITLRequest) -> None:
             "Thread",
             "add_message",
             AddMessageRequest(
-                participant_id=f"agent-run-{ctx.key()}",
-                participant_type="AGENT",
+                participant_id="system",
+                participant_type="SYSTEM",
                 role="SYSTEM",
                 content={"version": 1, "parts": [{"type": "event", "event": "AGENT_RUN_ORPHANED", "request_id": req.request_id}]},
                 idempotency_key=f"{ctx.key()}:orphaned:{req.request_id}",
                 tenant_id=req.tenant_id,
-                user_name=f"agent-run-{ctx.key()}",
+                user_name="system",
             ).model_dump_json().encode(),
             key=req.thread_id,
         )
